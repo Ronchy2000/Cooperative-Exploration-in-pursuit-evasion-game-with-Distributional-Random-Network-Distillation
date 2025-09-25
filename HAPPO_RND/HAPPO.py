@@ -336,9 +336,12 @@ class HAPPO_MPE:
         # 初始化保护因子
         factor = torch.ones((self.batch_size, self.episode_limit, 1), device=adv.device)
         
-        # 预处理动作
+        # 预处理动作 - 现在需要分别处理每个智能体的动作
         eps = 1e-6
-        a_n_raw_full = torch.atanh(torch.clamp(batch['a_n'], -1 + eps, 1 - eps))
+        a_n_raw_dict = {}
+        for agent_id in self.all_agents:
+            a_agent = batch['a_n'][agent_id]  # (batch_size, episode_limit, action_dim)
+            a_n_raw_dict[agent_id] = torch.atanh(torch.clamp(a_agent, -1 + eps, 1 - eps))
         
         # 按随机顺序更新每个智能体
         for agent_id in shuffled_agents:
@@ -350,7 +353,7 @@ class HAPPO_MPE:
             # 从填充的观察中提取该智能体的实际观察
             obs_agent_padded = batch['obs_n'][:, :, idx, :]  # (B, T, max_obs_dim)
             obs_agent = obs_agent_padded[:, :, :agent_obs_dim]  # (B, T, agent_obs_dim)
-            a_agent_raw = a_n_raw_full[:, :, idx, :]
+            a_agent_raw = a_n_raw_dict[agent_id]  # 使用该智能体的原始动作
             
             # 构建输入
             if self.add_agent_id:
@@ -454,9 +457,9 @@ class HAPPO_MPE:
         
         self._build_hetero_if_needed()
         # 添加调试信息
-        print(f"保存模型到: {actor_path}")
-        print(f"智能体列表: {self.all_agents}")
-        print(f"构建的智能体: {list(self.agents.keys())}")
+        # print(f"保存模型到: {actor_path}")
+        # print(f"智能体列表: {self.all_agents}")
+        # print(f"构建的智能体: {list(self.agents.keys())}")
         save_obj = {
             'format': 'hetero_per_agent_actor_v2',
             'agents': self.all_agents,

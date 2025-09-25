@@ -52,7 +52,7 @@ class Runner_MAPPO_MPE:
         self.num_obstacles = num_obstacles
         self.num_adversaries = num_adversaries
         self.seed = seed
-        self.number = getattr(args, 'number', 1)  # 添加默认值
+        self.number = num_good + num_adversaries
         
         # Set random seed
         np.random.seed(self.seed)
@@ -114,7 +114,12 @@ class Runner_MAPPO_MPE:
         
         self.replay_buffer = ReplayBuffer(self.args)
 
-        self.evaluate_rewards = []
+        self.evaluate_rewards = [] # Total_Reward
+        self.evaluate_adversary_rewards = []  # 追捕者总奖励
+        self.evaluate_adversary_avg_rewards = []  # 追捕者平均奖励
+        self.evaluate_good_rewards = []       # 逃跑者奖励
+        self.evaluate_individual_adversary_rewards = {agent_id: [] for agent_id in self.adversary_agents} # 为每个追捕者单独记录奖励
+        
         self.total_steps = 0
         
         if self.args.use_reward_norm:
@@ -173,7 +178,7 @@ class Runner_MAPPO_MPE:
                 self.evaluate_policy()
                 evaluate_num += 1
 
-            _, episode_steps = self.run_episode_mpe(evaluate=False)
+            _, _, _, _, episode_steps = self.run_episode_mpe(evaluate=False)
             self.total_steps += episode_steps
 
             if self.replay_buffer.episode_num == self.args.batch_size:
@@ -186,19 +191,51 @@ class Runner_MAPPO_MPE:
 
     def evaluate_policy(self):
         evaluate_reward = 0
+        evaluate_adversary_reward = 0  # 追捕者总奖励
+        evaluate_good_reward = 0       # 逃跑者总奖励
+        individual_adversary_rewards = {agent_id: 0 for agent_id in self.adversary_agents} # 为每个追捕者单独统计
         for _ in range(self.args.evaluate_times):
-            episode_reward, _ = self.run_episode_mpe(evaluate=True)
+            episode_reward, adversary_reward, good_reward, individual_rewards, _ = self.run_episode_mpe(evaluate=True)
             evaluate_reward += episode_reward
+            evaluate_adversary_reward += adversary_reward
+            evaluate_good_reward += good_reward
+            # 累加每个追捕者的奖励
+            for agent_id in self.adversary_agents:
+                individual_adversary_rewards[agent_id] += individual_rewards.get(agent_id, 0)
 
         evaluate_reward = evaluate_reward / self.args.evaluate_times
+        evaluate_adversary_reward = evaluate_adversary_reward / self.args.evaluate_times
+        evaluate_good_reward = evaluate_good_reward / self.args.evaluate_times
+        evaluate_adversary_avg_reward = evaluate_adversary_reward / len(self.adversary_agents) # 计算追捕者平均奖励（总奖励除以追捕者数量）
+        # 计算每个追捕者的平均奖励
+        for agent_id in self.adversary_agents:
+            individual_adversary_rewards[agent_id] = individual_adversary_rewards[agent_id] / self.args.evaluate_times
+        
+        # 保存奖励数据
         self.evaluate_rewards.append(evaluate_reward)
-        print("total_steps:{} \t evaluate_reward:{}".format(self.total_steps, evaluate_reward))
+        self.evaluate_adversary_rewards.append(evaluate_adversary_reward)
+        self.evaluate_adversary_avg_rewards.append(evaluate_adversary_avg_reward)
+        self.evaluate_good_rewards.append(evaluate_good_reward)
+
+        # 保存每个追捕者的奖励
+        for agent_id in self.adversary_agents:
+            self.evaluate_individual_adversary_rewards[agent_id].append(individual_adversary_rewards[agent_id])
+        print("total_steps:{} \t total_reward:{:.2f} \t adversary_total:{:.2f} \t adversary_avg:{:.2f} \t good_reward:{:.2f}".format(
+            self.total_steps, evaluate_reward, evaluate_adversary_reward, evaluate_adversary_avg_reward, evaluate_good_reward))
+
+        # 打印每个追捕者的奖励
+        for agent_id in self.adversary_agents:
+            print(f"  {agent_id}: {individual_adversary_rewards[agent_id]:.2f}")
         
         # Save the model
         self.agent_n.save_model(self.env_name, self.number, self.seed, self.total_steps, self.timestamp)
 
     def run_episode_mpe(self, evaluate=False):
         episode_reward = 0
+        episode_adversary_reward = 0  # 追捕者回合奖励
+        episode_good_reward = 0       # 逃跑者回合奖励
+        individual_adversary_rewards = {agent_id: 0 for agent_id in self.adversary_agents} # 为每个追捕者单独统计
+
         obs_dict, _ = self.env.reset()
         done_dict = {agent_id: False for agent_id in self.agent_n.all_agents}
         
@@ -221,10 +258,19 @@ class Runner_MAPPO_MPE:
             # 环境步进
             next_obs_dict, rewards_dict, terminated_dict, truncated_dict, _ = self.env.step(actions_dict)
             
-            # 计算总奖励
-            step_reward = sum(rewards_dict.values())
-            episode_reward += step_reward
+            # 分别计算不同类型智能体的奖励
+            step_adversary_reward = sum([rewards_dict.get(agent_id, 0) for agent_id in self.adversary_agents])
+            step_good_reward = sum([rewards_dict.get(agent_id, 0) for agent_id in self.good_agents])
+            step_total_reward = step_adversary_reward + step_good_reward
             
+            # 为每个追捕者单独累加奖励
+            for agent_id in self.adversary_agents:
+                individual_adversary_rewards[agent_id] += rewards_dict.get(agent_id, 0)
+            
+            episode_reward += step_total_reward
+            episode_adversary_reward += step_adversary_reward
+            episode_good_reward += step_good_reward
+
             # 更新done标志
             for agent_id in terminated_dict:
                 if terminated_dict[agent_id] or truncated_dict[agent_id]:
@@ -279,28 +325,52 @@ class Runner_MAPPO_MPE:
             v_n = self.agent_n.get_value(s)
             self.replay_buffer.store_last_value(episode_step + 1, v_n)
 
-        return episode_reward, episode_step + 1
+        return episode_reward, episode_adversary_reward, episode_good_reward, individual_adversary_rewards, episode_step + 1
 
     def save_rewards_to_csv(self):
-        """保存评估奖励数据到CSV文件"""
+        """保存详细的分类评估奖励数据到CSV文件"""
         current_dir = os.path.dirname(os.path.abspath(__file__))
         data_dir = os.path.join(current_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
-        filename = os.path.join(data_dir, f"happo_rewards_{self.env_name}_n{self.number}_s{self.seed}_{self.timestamp}.csv")
+        
+        # 保存详细的分类奖励数据
+        filename = os.path.join(data_dir, f"happo_detailed_rewards_{self.env_name}_n{self.number}_s{self.seed}_{self.timestamp}.csv")
         
         steps = [i * self.args.evaluate_freq for i in range(len(self.evaluate_rewards))]
         
         with open(filename, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(['Steps', 'Reward'])
-            for step, reward in zip(steps, self.evaluate_rewards):
-                writer.writerow([step, reward])
-        print(f"评估奖励数据已保存到 {filename}")
+            
+            # 创建表头
+            header = ['Steps', 'Total_Reward', 'Adversary_Total', 'Adversary_Avg', 'Good_Reward']
+            # 为每个追捕者添加单独的列
+            for agent_id in self.adversary_agents:
+                header.append(f'{agent_id}_Reward')
+            
+            writer.writerow(header)
+            
+            # 写入数据
+            for i, step in enumerate(steps):
+                row = [
+                    step,
+                    self.evaluate_rewards[i],
+                    self.evaluate_adversary_rewards[i],
+                    self.evaluate_adversary_avg_rewards[i],
+                    self.evaluate_good_rewards[i]
+                ]
+                # 添加每个追捕者的奖励
+                for agent_id in self.adversary_agents:
+                    row.append(self.evaluate_individual_adversary_rewards[agent_id][i])
+                
+                writer.writerow(row)
+        
+        print(f"详细评估奖励数据已保存到 {filename}")
+        print(f"保存的数据包含: 总奖励、追捕者总奖励、追捕者平均奖励、逃跑者奖励，以及{len(self.adversary_agents)}个追捕者的单独奖励")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("Hyperparameters Setting for HAPPO in MPE environment")
     parser.add_argument("--device", type=str, default='cpu', help="training device")
-    parser.add_argument("--max_train_steps", type=int, default=int(2e6), help="Maximum number of training steps")
+    parser.add_argument("--max_train_steps", type=int, default=int(1e5), help="Maximum number of training steps")
     parser.add_argument("--episode_limit", type=int, default=100, help="Maximum number of steps per episode")
     parser.add_argument("--evaluate_freq", type=float, default=1000, help="Evaluate the policy every 'evaluate_freq' steps")
     parser.add_argument("--evaluate_times", type=float, default=3, help="Evaluate times")
@@ -330,5 +400,5 @@ if __name__ == '__main__':
     parser.add_argument("--number", type=int, default=1, help="Experiment number")
 
     args = parser.parse_args()
-    runner = Runner_MAPPO_MPE(args, num_good=1, num_adversaries=3, num_obstacles = 0, seed=23, env_name="simple_tag_env_v4_partially")
+    runner = Runner_MAPPO_MPE(args, num_good=1, num_adversaries=3, num_obstacles = 0, seed=23, env_name="simple_tag_v3")
     runner.run()

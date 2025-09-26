@@ -1,3 +1,8 @@
+# TODO
+- [ ]添加RND算法
+- [ ]添加DRND算法
+
+
 # HAPPO for Heterogeneous Multi-Agent Reinforcement Learning
 
 本项目实现了HAPPO（Heterogeneous-Agent Proximal Policy Optimization）算法，专门针对异构多智能体环境设计，如PettingZoo的Simple_tag_v3环境。

@@ -1,0 +1,42 @@
+####################
+# 忽略系统文件
+.idea/
+
+#忽略所有的__pycache__目录以及所有的.pyc、.pyo和.pyd文件
+**/__pycache__
+*.py[cod]
+
+#macOS
+**/.DS_Store
+Desktop.ini
+
+# Thumbnail cache files
+._*
+Thumbs.db
+
+# Files that might appear on external disks
+.Spotlight-V100
+.Trashes
+
+# Compiled Python files
+*.pyc
+
+# Temp File
+*.swp
+*.swa
+*.swo
+
+# github merge file
+*.orig
+
+# virtualenv 
+venv
+__pycache__
+
+#vscode
+.vscode
+
+####################
+### 用户修改：
+#如果你想忽略所有名为logs的文件夹，无论它们在项目中的位置如何，你可以在.gitignore文件中添加以下内容：
+**/logs/

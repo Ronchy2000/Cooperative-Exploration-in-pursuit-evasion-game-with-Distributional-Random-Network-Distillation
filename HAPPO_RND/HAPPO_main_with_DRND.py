@@ -4,7 +4,7 @@ from torch.utils.tensorboard import SummaryWriter
 import argparse
 from normalization import Normalization, RewardScaling
 from replay_buffer import ReplayBuffer
-from HAPPO import HAPPO_MPE
+from HAPPO_DRND import HAPPO_MPE_with_DRND
 
 from pettingzoo.mpe import simple_adversary_v3, simple_spread_v3, simple_tag_v3
 from envs import simple_tag_env_v4_partially
@@ -44,7 +44,9 @@ def get_env(env_name, num_good, num_adversaries, num_obstacles, ep_len=25, rende
     print("action_bound:", action_bound)
     return new_env, _dim_info, action_bound
 
-class Runner_MAPPO_MPE:
+class Runner_HAPPO_DRND_MPE:
+    """⭐ 集成DRND探索的HAPPO训练器"""
+    
     def __init__(self, args, num_good, num_adversaries, num_obstacles, seed, env_name):
         self.args = args
         self.env_name = env_name
@@ -86,10 +88,8 @@ class Runner_MAPPO_MPE:
         
         # 为了处理异构观察，我们使用最大观察维度
         self.max_obs_dim = max(self.args.obs_dim_n)
-        self.args.obs_dim = self.max_obs_dim  # 使用最大观察维度
+        self.args.obs_dim = self.max_obs_dim
         self.args.action_dim = self.args.action_dim_n[0]
-        
-        # 添加这一行来修复动作维度不匹配问题
         self.args.act_dim = self.args.action_dim
         
         # 计算全局状态维度（所有智能体观察的总和）
@@ -100,12 +100,13 @@ class Runner_MAPPO_MPE:
         print("max_obs_dim={}".format(self.max_obs_dim))
         print("action_space=", self.env.action_space)
         print("action_dim_n={}".format(self.args.action_dim_n))
+        print(f"⭐ 全局状态维度: {self.args.state_dim}")
 
-        # Create agent with heterogeneous support
-        self.agent_n = HAPPO_MPE(self.args)
+        # ⭐ Create agent with DRND
+        self.agent_n = HAPPO_MPE_with_DRND(self.args)
         self.agent_n.env = self.env
         self.agent_n.all_agents = [agent_id for agent_id in self.env.agents]
-        self.agent_n.dim_info = self.dim_info  # 设置维度信息
+        self.agent_n.dim_info = self.dim_info
         
         # 为环境添加get_obs_dims方法
         def get_obs_dims():
@@ -114,11 +115,16 @@ class Runner_MAPPO_MPE:
         
         self.replay_buffer = ReplayBuffer(self.args)
 
-        self.evaluate_rewards = [] # Total_Reward
-        self.evaluate_adversary_rewards = []  # 追捕者总奖励
-        self.evaluate_adversary_avg_rewards = []  # 追捕者平均奖励
-        self.evaluate_good_rewards = []       # 逃跑者奖励
-        self.evaluate_individual_adversary_rewards = {agent_id: [] for agent_id in self.adversary_agents} # 为每个追捕者单独记录奖励
+        # 奖励记录
+        self.evaluate_rewards = []
+        self.evaluate_adversary_rewards = []
+        self.evaluate_adversary_avg_rewards = []
+        self.evaluate_good_rewards = []
+        self.evaluate_individual_adversary_rewards = {agent_id: [] for agent_id in self.adversary_agents}
+        
+        # ⭐ DRND相关记录
+        self.intrinsic_reward_history = []
+        self.exploration_coverage = []  # 探索覆盖率记录
         
         self.total_steps = 0
         
@@ -128,6 +134,14 @@ class Runner_MAPPO_MPE:
         elif self.args.use_reward_scaling:
             print("------use reward scaling------")
             self.reward_scaling = RewardScaling(shape=self.args.N, gamma=self.args.gamma)
+        
+        # ⭐ 初始化tensorboard（可选）
+        if getattr(args, 'use_tensorboard', False):
+            log_dir = f"runs/HAPPO_DRND_{env_name}_{self.timestamp}"
+            self.writer = SummaryWriter(log_dir)
+            print(f"Tensorboard日志目录: {log_dir}")
+        else:
+            self.writer = None
 
     def _pad_obs_to_max_dim(self, obs_dict):
         """将不同维度的观察填充到最大维度 - 仅用于replay buffer存储"""
@@ -148,7 +162,7 @@ class Runner_MAPPO_MPE:
         return np.array(obs_list)
 
     def _get_global_state(self, obs_dict):
-        """获取全局状态（保持原始维度）- 用于Critic网络"""
+        """⭐ 获取全局状态（保持原始维度）- 用于DRND和Critic网络"""
         state_parts = []
         for agent_id in self.agent_n.all_agents:
             if agent_id in obs_dict:
@@ -158,20 +172,9 @@ class Runner_MAPPO_MPE:
                 agent_obs_dim = self.dim_info[agent_id][0]
                 state_parts.append(np.zeros(agent_obs_dim))
         return np.concatenate(state_parts)
-    
-    def _obs_dict_to_individual_tensors(self, obs_dict):
-        """将观察字典转换为各智能体的独立观察（保持原始维度）"""
-        obs_tensors = {}
-        for agent_id in self.agent_n.all_agents:
-            if agent_id in obs_dict:
-                obs_tensors[agent_id] = obs_dict[agent_id]
-            else:
-                # 为缺失的智能体创建零观察
-                agent_obs_dim = self.dim_info[agent_id][0]
-                obs_tensors[agent_id] = np.zeros(agent_obs_dim)
-        return obs_tensors
 
     def run(self):
+        """主训练循环"""
         evaluate_num = -1
         while self.total_steps < self.args.max_train_steps:
             if self.total_steps // self.args.evaluate_freq > evaluate_num:
@@ -187,18 +190,29 @@ class Runner_MAPPO_MPE:
 
         self.evaluate_policy()
         self.save_rewards_to_csv()
+        if self.writer:
+            self.writer.close()
         self.env.close()
 
     def evaluate_policy(self):
+        """评估策略性能"""
         evaluate_reward = 0
-        evaluate_adversary_reward = 0  # 追捕者总奖励
-        evaluate_good_reward = 0       # 逃跑者总奖励
-        individual_adversary_rewards = {agent_id: 0 for agent_id in self.adversary_agents} # 为每个追捕者单独统计
+        evaluate_adversary_reward = 0
+        evaluate_good_reward = 0
+        individual_adversary_rewards = {agent_id: 0 for agent_id in self.adversary_agents}
+        
+        # ⭐ DRND评估指标
+        total_intrinsic_reward = 0
+        exploration_states = set()  # 用于估计探索覆盖率
+        
         for _ in range(self.args.evaluate_times):
-            episode_reward, adversary_reward, good_reward, individual_rewards, _ = self.run_episode_mpe(evaluate=True)
+            episode_reward, adversary_reward, good_reward, individual_rewards, intrinsic_reward, visited_states = self.run_episode_mpe(evaluate=True, collect_exploration_metrics=True)
             evaluate_reward += episode_reward
             evaluate_adversary_reward += adversary_reward
             evaluate_good_reward += good_reward
+            total_intrinsic_reward += intrinsic_reward
+            exploration_states.update(visited_states)
+            
             # 累加每个追捕者的奖励
             for agent_id in self.adversary_agents:
                 individual_adversary_rewards[agent_id] += individual_rewards.get(agent_id, 0)
@@ -206,7 +220,10 @@ class Runner_MAPPO_MPE:
         evaluate_reward = evaluate_reward / self.args.evaluate_times
         evaluate_adversary_reward = evaluate_adversary_reward / self.args.evaluate_times
         evaluate_good_reward = evaluate_good_reward / self.args.evaluate_times
-        evaluate_adversary_avg_reward = evaluate_adversary_reward / len(self.adversary_agents) # 计算追捕者平均奖励（总奖励除以追捕者数量）
+        evaluate_adversary_avg_reward = evaluate_adversary_reward / len(self.adversary_agents)
+        avg_intrinsic_reward = total_intrinsic_reward / self.args.evaluate_times
+        exploration_coverage = len(exploration_states)
+        
         # 计算每个追捕者的平均奖励
         for agent_id in self.adversary_agents:
             individual_adversary_rewards[agent_id] = individual_adversary_rewards[agent_id] / self.args.evaluate_times
@@ -216,25 +233,44 @@ class Runner_MAPPO_MPE:
         self.evaluate_adversary_rewards.append(evaluate_adversary_reward)
         self.evaluate_adversary_avg_rewards.append(evaluate_adversary_avg_reward)
         self.evaluate_good_rewards.append(evaluate_good_reward)
+        
+        # ⭐ 保存DRND指标
+        self.intrinsic_reward_history.append(avg_intrinsic_reward)
+        self.exploration_coverage.append(exploration_coverage)
 
         # 保存每个追捕者的奖励
         for agent_id in self.adversary_agents:
             self.evaluate_individual_adversary_rewards[agent_id].append(individual_adversary_rewards[agent_id])
+        
         print("total_steps:{} \t total_reward:{:.2f} \t adversary_total:{:.2f} \t adversary_avg:{:.2f} \t good_reward:{:.2f}".format(
             self.total_steps, evaluate_reward, evaluate_adversary_reward, evaluate_adversary_avg_reward, evaluate_good_reward))
+        print(f"⭐ DRND指标 - 内在奖励:{avg_intrinsic_reward:.4f} \t 探索覆盖:{exploration_coverage}")
 
         # 打印每个追捕者的奖励
         for agent_id in self.adversary_agents:
             print(f"  {agent_id}: {individual_adversary_rewards[agent_id]:.2f}")
         
+        # ⭐ Tensorboard记录
+        if self.writer:
+            self.writer.add_scalar('Eval/Total_Reward', evaluate_reward, self.total_steps)
+            self.writer.add_scalar('Eval/Adversary_Reward', evaluate_adversary_reward, self.total_steps)
+            self.writer.add_scalar('Eval/Good_Reward', evaluate_good_reward, self.total_steps)
+            self.writer.add_scalar('DRND/Intrinsic_Reward', avg_intrinsic_reward, self.total_steps)
+            self.writer.add_scalar('DRND/Exploration_Coverage', exploration_coverage, self.total_steps)
+        
         # Save the model
         self.agent_n.save_model(self.env_name, self.number, self.seed, self.total_steps, self.timestamp)
 
-    def run_episode_mpe(self, evaluate=False):
+    def run_episode_mpe(self, evaluate=False, collect_exploration_metrics=False):
+        """运行一个episode"""
         episode_reward = 0
-        episode_adversary_reward = 0  # 追捕者回合奖励
-        episode_good_reward = 0       # 逃跑者回合奖励
-        individual_adversary_rewards = {agent_id: 0 for agent_id in self.adversary_agents} # 为每个追捕者单独统计
+        episode_adversary_reward = 0
+        episode_good_reward = 0
+        individual_adversary_rewards = {agent_id: 0 for agent_id in self.adversary_agents}
+        
+        # ⭐ DRND指标
+        episode_intrinsic_reward = 0
+        visited_states = set()
 
         obs_dict, _ = self.env.reset()
         done_dict = {agent_id: False for agent_id in self.agent_n.all_agents}
@@ -251,9 +287,22 @@ class Runner_MAPPO_MPE:
             # 将观察转换为填充后的数组（所有智能体使用相同维度）
             obs_n = self._pad_obs_to_max_dim(obs_dict)
             
-            # 获取全局状态（保持原始维度拼接）
+            # ⭐ 获取全局状态（用于DRND）
             s = self._get_global_state(obs_dict)
             v_n = self.agent_n.get_value(s)
+            
+            # ⭐ 计算内在奖励（如果启用DRND且不在评估模式）
+            step_intrinsic_reward = 0
+            if not evaluate and self.agent_n.use_drnd and self.agent_n._drnd_initialized:
+                intrinsic_reward_tensor = self.agent_n.drnd.compute_intrinsic_reward(s)
+                step_intrinsic_reward = intrinsic_reward_tensor.item()
+                episode_intrinsic_reward += step_intrinsic_reward
+            
+            # ⭐ 收集探索指标（评估时）
+            if collect_exploration_metrics:
+                # 将状态转换为可哈希的元组（用于集合）
+                state_hash = tuple(np.round(s, 2))  # 四舍五入以减少状态空间
+                visited_states.add(state_hash)
             
             # 环境步进
             next_obs_dict, rewards_dict, terminated_dict, truncated_dict, _ = self.env.step(actions_dict)
@@ -325,16 +374,19 @@ class Runner_MAPPO_MPE:
             v_n = self.agent_n.get_value(s)
             self.replay_buffer.store_last_value(episode_step + 1, v_n)
 
-        return episode_reward, episode_adversary_reward, episode_good_reward, individual_adversary_rewards, episode_step + 1
+        if collect_exploration_metrics:
+            return episode_reward, episode_adversary_reward, episode_good_reward, individual_adversary_rewards, episode_intrinsic_reward, visited_states
+        else:
+            return episode_reward, episode_adversary_reward, episode_good_reward, individual_adversary_rewards, episode_step + 1
 
     def save_rewards_to_csv(self):
-        """保存详细的分类评估奖励数据到CSV文件"""
+        """⭐ 保存详细的分类评估奖励数据到CSV文件（包括DRND指标）"""
         current_dir = os.path.dirname(os.path.abspath(__file__))
         data_dir = os.path.join(current_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
         
         # 保存详细的分类奖励数据
-        filename = os.path.join(data_dir, f"happo_detailed_rewards_{self.env_name}_n{self.number}_s{self.seed}_{self.timestamp}.csv")
+        filename = os.path.join(data_dir, f"happo_drnd_detailed_rewards_{self.env_name}_n{self.number}_s{self.seed}_{self.timestamp}.csv")
         
         steps = [i * self.args.evaluate_freq for i in range(len(self.evaluate_rewards))]
         
@@ -342,7 +394,7 @@ class Runner_MAPPO_MPE:
             writer = csv.writer(csvfile)
             
             # 创建表头
-            header = ['Steps', 'Total_Reward', 'Adversary_Total', 'Adversary_Avg', 'Good_Reward']
+            header = ['Steps', 'Total_Reward', 'Adversary_Total', 'Adversary_Avg', 'Good_Reward', 'Intrinsic_Reward', 'Exploration_Coverage']
             # 为每个追捕者添加单独的列
             for agent_id in self.adversary_agents:
                 header.append(f'{agent_id}_Reward')
@@ -356,7 +408,9 @@ class Runner_MAPPO_MPE:
                     self.evaluate_rewards[i],
                     self.evaluate_adversary_rewards[i],
                     self.evaluate_adversary_avg_rewards[i],
-                    self.evaluate_good_rewards[i]
+                    self.evaluate_good_rewards[i],
+                    self.intrinsic_reward_history[i] if i < len(self.intrinsic_reward_history) else 0,
+                    self.exploration_coverage[i] if i < len(self.exploration_coverage) else 0
                 ]
                 # 添加每个追捕者的奖励
                 for agent_id in self.adversary_agents:
@@ -364,11 +418,11 @@ class Runner_MAPPO_MPE:
                 
                 writer.writerow(row)
         
-        print(f"详细评估奖励数据已保存到 {filename}")
-        print(f"保存的数据包含: 总奖励、追捕者总奖励、追捕者平均奖励、逃跑者奖励，以及{len(self.adversary_agents)}个追捕者的单独奖励")
+        print(f"⭐ HAPPO+DRND详细评估奖励数据已保存到 {filename}")
+        print(f"保存的数据包含: 总奖励、追捕者总奖励、追捕者平均奖励、逃跑者奖励、内在奖励、探索覆盖率，以及{len(self.adversary_agents)}个追捕者的单独奖励")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser("Hyperparameters Setting for HAPPO in MPE environment")
+    parser = argparse.ArgumentParser("Hyperparameters Setting for HAPPO+DRND in MPE environment")
     parser.add_argument("--device", type=str, default='cpu', help="training device")
     parser.add_argument("--max_train_steps", type=int, default=int(1e5), help="Maximum number of training steps")
     parser.add_argument("--episode_limit", type=int, default=100, help="Maximum number of steps per episode")
@@ -398,7 +452,27 @@ if __name__ == '__main__':
     parser.add_argument("--use_value_clip", type=float, default=False, help="Whether to use value clip")
     parser.add_argument("--act_dim", type=float, default=5, help="Act_dimension")
     parser.add_argument("--number", type=int, default=1, help="Experiment number")
+    
+    # ⭐ DRND参数
+    parser.add_argument("--use_drnd", type=bool, default=True, help="Whether to use DRND exploration")
+    parser.add_argument("--drnd_output_dim", type=int, default=64, help="DRND target network output dimension")
+    parser.add_argument("--drnd_hidden_dim", type=int, default=128, help="DRND network hidden dimension")
+    parser.add_argument("--drnd_lr", type=float, default=3e-4, help="DRND predictor learning rate")
+    parser.add_argument("--drnd_alpha", type=float, default=0.9, help="DRND dual-phase exploration weight")
+    parser.add_argument("--intrinsic_reward_coeff", type=float, default=1.0, help="Intrinsic reward coefficient")
+    parser.add_argument("--drnd_update_freq", type=int, default=1, help="DRND predictor update frequency")
+    parser.add_argument("--use_tensorboard", type=bool, default=False, help="Whether to use tensorboard logging")
 
     args = parser.parse_args()
-    runner = Runner_MAPPO_MPE(args, num_good=1, num_adversaries=3, num_obstacles = 0, seed=23, env_name="simple_tag_v3")
+    
+    print("⭐ 开始HAPPO+DRND训练")
+    print(f"DRND参数:")
+    print(f"  - 使用DRND: {args.use_drnd}")
+    print(f"  - 靶网络输出维度: {args.drnd_output_dim}")
+    print(f"  - 隐藏层维度: {args.drnd_hidden_dim}")
+    print(f"  - 学习率: {args.drnd_lr}")
+    print(f"  - 双阶段权重α: {args.drnd_alpha}")
+    print(f"  - 内在奖励系数: {args.intrinsic_reward_coeff}")
+    
+    runner = Runner_HAPPO_DRND_MPE(args, num_good=1, num_adversaries=3, num_obstacles=0, seed=23, env_name="simple_tag_v3")
     runner.run()

@@ -62,6 +62,16 @@ class Runner_MAPPO_MPE:
         self.timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
         print(f"训练开始时间戳: {self.timestamp}")
         
+        # 初始化TensorBoard
+        self.writer = None
+        if args.use_tensorboard:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            log_dir = os.path.join(current_dir, "logs", "tensorboard_logs", f"{env_name}_{self.timestamp}")
+            os.makedirs(log_dir, exist_ok=True)
+            self.writer = SummaryWriter(log_dir)
+            print(f"TensorBoard日志保存到: {log_dir}")
+            print("启动TensorBoard命令: tensorboard --logdir=tensorboard_logs")
+
         # Create env
         self.env, self.dim_info, _ = get_env(env_name=env_name, num_good=self.num_good, num_adversaries=self.num_adversaries, num_obstacles= self.num_obstacles, ep_len=self.args.episode_limit)
         print("self.env.agents", self.env.agents)
@@ -107,6 +117,12 @@ class Runner_MAPPO_MPE:
         self.agent_n.all_agents = [agent_id for agent_id in self.env.agents]
         self.agent_n.dim_info = self.dim_info  # 设置维度信息
         
+        # 传递TensorBoard writer给agent
+        if self.writer:
+            self.agent_n.writer = self.writer
+            self.agent_n.adversary_agents = self.adversary_agents
+            self.agent_n.good_agents = self.good_agents
+        
         # 为环境添加get_obs_dims方法
         def get_obs_dims():
             return {agent_id: self.env.observation_space(agent_id).shape[0] for agent_id in self.env.agents}
@@ -128,7 +144,10 @@ class Runner_MAPPO_MPE:
         elif self.args.use_reward_scaling:
             print("------use reward scaling------")
             self.reward_scaling = RewardScaling(shape=self.args.N, gamma=self.args.gamma)
-
+        elif self.args.use_manual_reward_scale:
+            print(f"------use manual reward scaling (factor: {self.args.reward_scale_factor})------")
+            self.manual_reward_scaler = lambda r: r * self.args.reward_scale_factor
+        
     def _pad_obs_to_max_dim(self, obs_dict):
         """将不同维度的观察填充到最大维度 - 仅用于replay buffer存储"""
         obs_list = []
@@ -182,13 +201,59 @@ class Runner_MAPPO_MPE:
             self.total_steps += episode_steps
 
             if self.replay_buffer.episode_num == self.args.batch_size:
-                self.agent_n.train(self.replay_buffer, self.total_steps)
+                # self.agent_n.train(self.replay_buffer, self.total_steps)
+                # 训练并获取损失
+                critic_losses = self.agent_n.train(self.replay_buffer, self.total_steps)
+                # 记录Critic损失到TensorBoard
+                if self.writer and critic_losses:
+                    self.log_critic_losses(critic_losses, self.total_steps)
+                
                 self.replay_buffer.reset_buffer()
 
         self.evaluate_policy()
         self.save_rewards_to_csv()
+        # 关闭TensorBoard writer
+        if self.writer:
+            self.writer.close()
         self.env.close()
 
+    def log_critic_losses(self, critic_losses, total_steps):
+        """记录Critic损失到TensorBoard"""
+        if not self.writer or not critic_losses:
+            return
+        
+        # 记录每个智能体的Critic损失
+        for agent_id, loss_value in critic_losses.items():
+            self.writer.add_scalar(f'Loss/Critic/{agent_id}', loss_value, total_steps)
+        
+        # 分别计算追捕者和逃跑者的平均损失
+        adversary_losses = [critic_losses[agent_id] for agent_id in self.adversary_agents if agent_id in critic_losses]
+        good_losses = [critic_losses[agent_id] for agent_id in self.good_agents if agent_id in critic_losses]
+        
+        if adversary_losses:
+            avg_adversary_loss = sum(adversary_losses) / len(adversary_losses)
+            self.writer.add_scalar('Loss/Critic/Adversaries_Average', avg_adversary_loss, total_steps)
+            
+            # 记录每个追捕者的损失
+            for agent_id in self.adversary_agents:
+                if agent_id in critic_losses:
+                    self.writer.add_scalar(f'Loss/Critic/Adversaries/{agent_id}', critic_losses[agent_id], total_steps)
+        
+        if good_losses:
+            avg_good_loss = sum(good_losses) / len(good_losses)
+            self.writer.add_scalar('Loss/Critic/Good_Agents_Average', avg_good_loss, total_steps)
+            
+            # 记录每个逃跑者的损失
+            for agent_id in self.good_agents:
+                if agent_id in critic_losses:
+                    self.writer.add_scalar(f'Loss/Critic/Good_Agents/{agent_id}', critic_losses[agent_id], total_steps)
+        
+        # 记录所有智能体的平均损失
+        all_losses = list(critic_losses.values())
+        if all_losses:
+            avg_all_loss = sum(all_losses) / len(all_losses)
+            self.writer.add_scalar('Loss/Critic/All_Average', avg_all_loss, total_steps)
+    
     def evaluate_policy(self):
         evaluate_reward = 0
         evaluate_adversary_reward = 0  # 追捕者总奖励
@@ -210,6 +275,13 @@ class Runner_MAPPO_MPE:
         # 计算每个追捕者的平均奖励
         for agent_id in self.adversary_agents:
             individual_adversary_rewards[agent_id] = individual_adversary_rewards[agent_id] / self.args.evaluate_times
+        
+        # 记录评估奖励到TensorBoard
+        if self.writer:
+            self.writer.add_scalar('Evaluation/Total_Reward', evaluate_reward, self.total_steps)
+            self.writer.add_scalar('Evaluation/Adversary_Total_Reward', evaluate_adversary_reward, self.total_steps)
+            self.writer.add_scalar('Evaluation/Adversary_Average_Reward', evaluate_adversary_avg_reward, self.total_steps)
+            self.writer.add_scalar('Evaluation/Good_Reward', evaluate_good_reward, self.total_steps)
         
         # 保存奖励数据
         self.evaluate_rewards.append(evaluate_reward)
@@ -310,6 +382,8 @@ class Runner_MAPPO_MPE:
                     r_n = self.reward_norm(r_n)
                 elif self.args.use_reward_scaling:
                     r_n = self.reward_scaling(r_n)
+                elif self.args.use_manual_reward_scale:
+                    r_n = self.manual_reward_scaler(r_n)
 
                 # 存储转换 - 使用字典形式的动作
                 self.replay_buffer.store_transition(episode_step, obs_n, s, v_n, a_dict, a_logprob_n, r_n, done_n)
@@ -370,7 +444,7 @@ class Runner_MAPPO_MPE:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("Hyperparameters Setting for HAPPO in MPE environment")
     parser.add_argument("--device", type=str, default='cpu', help="training device")
-    parser.add_argument("--max_train_steps", type=int, default=int(1e5), help="Maximum number of training steps")
+    parser.add_argument("--max_train_steps", type=int, default=int(5e6), help="Maximum number of training steps")
     parser.add_argument("--episode_limit", type=int, default=100, help="Maximum number of steps per episode")
     parser.add_argument("--evaluate_freq", type=float, default=1000, help="Evaluate the policy every 'evaluate_freq' steps")
     parser.add_argument("--evaluate_times", type=float, default=3, help="Evaluate times")
@@ -385,8 +459,12 @@ if __name__ == '__main__':
     parser.add_argument("--epsilon", type=float, default=0.2, help="PPO clip parameter")
     parser.add_argument("--K_epochs", type=int, default=15, help="PPO update epochs")
     parser.add_argument("--use_adv_norm", type=bool, default=True, help="Trick 1:advantage normalization")
+
     parser.add_argument("--use_reward_norm", type=bool, default=True, help="Trick 3:reward normalization")
     parser.add_argument("--use_reward_scaling", type=bool, default=False, help="Trick 4:reward scaling")
+    parser.add_argument("--use_manual_reward_scale", type=bool, default=False, help="Use manual reward scaling with fixed factor") # 与下面的参数配套使用， 三者优先级从上往下
+    parser.add_argument("--reward_scale_factor", type=float, default=1/6.3, help="Manual reward scaling factor (e.g., 0.1, 10)")
+
     parser.add_argument("--entropy_coef", type=float, default=0.01, help="Trick 5: policy entropy")
     parser.add_argument("--use_lr_decay", type=bool, default=True, help="Trick 6:learning rate Decay")
     parser.add_argument("--use_grad_clip", type=bool, default=True, help="Trick 7: Gradient clip")
@@ -398,6 +476,7 @@ if __name__ == '__main__':
     parser.add_argument("--use_value_clip", type=float, default=False, help="Whether to use value clip")
     parser.add_argument("--act_dim", type=float, default=5, help="Act_dimension")
     parser.add_argument("--number", type=int, default=1, help="Experiment number")
+    parser.add_argument("--use_tensorboard", type=bool, default=True, help="Whether to use TensorBoard for logging")
 
     args = parser.parse_args()
     runner = Runner_MAPPO_MPE(args, num_good=1, num_adversaries=3, num_obstacles = 0, seed=23, env_name="simple_tag_v3")

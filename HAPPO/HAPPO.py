@@ -207,6 +207,11 @@ class HAPPO_MPE:
         self.use_value_clip = args.use_value_clip
         self.device = args.device
         
+        # TensorBoard相关
+        self.writer = None
+        self.adversary_agents = []
+        self.good_agents = []
+
         # 异构构建标志
         self._hetero_built = False
         
@@ -314,129 +319,145 @@ class HAPPO_MPE:
             return v_n.cpu().numpy().flatten()
 
     def train(self, replay_buffer, total_steps):
-        self._build_hetero_if_needed()
-        batch = replay_buffer.get_training_data()
+            self._build_hetero_if_needed()
+            batch = replay_buffer.get_training_data()
 
-        # 计算GAE优势
-        adv = []
-        gae = 0
-        with torch.no_grad():
-            deltas = batch['r_n'] + self.gamma * batch['v_n'][:, 1:] * (1 - batch['done_n']) - batch['v_n'][:, :-1]
-            for t in reversed(range(self.episode_limit)):
-                gae = deltas[:, t] + self.gamma * self.lamda * gae
-                adv.insert(0, gae)
-            adv = torch.stack(adv, dim=1)
-            v_target = adv + batch['v_n'][:, :-1]
-            if self.use_adv_norm:
-                adv = ((adv - adv.mean()) / (adv.std() + 1e-5))
+            # 计算GAE优势
+            adv = []
+            gae = 0
+            with torch.no_grad():
+                deltas = batch['r_n'] + self.gamma * batch['v_n'][:, 1:] * (1 - batch['done_n']) - batch['v_n'][:, :-1]
+                for t in reversed(range(self.episode_limit)):
+                    gae = deltas[:, t] + self.gamma * self.lamda * gae
+                    adv.insert(0, gae)
+                adv = torch.stack(adv, dim=1)
+                v_target = adv + batch['v_n'][:, :-1]
+                if self.use_adv_norm:
+                    adv = ((adv - adv.mean()) / (adv.std() + 1e-5))
 
-        # HAPPO: 随机打乱智能体更新顺序
-        shuffled_agents = np.random.permutation(self.all_agents).tolist()
-        
-        # 初始化保护因子
-        factor = torch.ones((self.batch_size, self.episode_limit, 1), device=adv.device)
-        
-        # 预处理动作 - 现在需要分别处理每个智能体的动作
-        eps = 1e-6
-        a_n_raw_dict = {}
-        for agent_id in self.all_agents:
-            a_agent = batch['a_n'][agent_id]  # (batch_size, episode_limit, action_dim)
-            a_n_raw_dict[agent_id] = torch.atanh(torch.clamp(a_agent, -1 + eps, 1 - eps))
-        
-        # 按随机顺序更新每个智能体
-        for agent_id in shuffled_agents:
-            idx = self.agent_index[agent_id]
+            # HAPPO: 随机打乱智能体更新顺序
+            shuffled_agents = np.random.permutation(self.all_agents).tolist()
             
-            # 获取该智能体的真实观察维度
-            agent_obs_dim = self.dim_info[agent_id][0]
+            # 初始化保护因子
+            factor = torch.ones((self.batch_size, self.episode_limit, 1), device=adv.device)
             
-            # 从填充的观察中提取该智能体的实际观察
-            obs_agent_padded = batch['obs_n'][:, :, idx, :]  # (B, T, max_obs_dim)
-            obs_agent = obs_agent_padded[:, :, :agent_obs_dim]  # (B, T, agent_obs_dim)
-            a_agent_raw = a_n_raw_dict[agent_id]  # 使用该智能体的原始动作
+            # 存储Critic损失用于TensorBoard记录
+            critic_losses = {}
             
-            # 构建输入
-            if self.add_agent_id:
-                one_hot = torch.eye(self.N, device=adv.device)[idx].view(1, 1, -1).repeat(self.batch_size, self.episode_limit, 1)
-                actor_input = torch.cat([obs_agent, one_hot], dim=-1)
-            else:
-                actor_input = obs_agent
+            # 预处理动作 - 现在需要分别处理每个智能体的动作
+            eps = 1e-6
+            a_n_raw_dict = {}
+            for agent_id in self.all_agents:
+                a_agent = batch['a_n'][agent_id]  # (batch_size, episode_limit, action_dim)
+                a_n_raw_dict[agent_id] = torch.atanh(torch.clamp(a_agent, -1 + eps, 1 - eps))
+            
+            # 按随机顺序更新每个智能体
+            for agent_id in shuffled_agents:
+                idx = self.agent_index[agent_id]
                 
-            # 计算更新前的log概率
-            with torch.no_grad():
-                mean_old, std_old = self.agents[agent_id].actor(actor_input)
-                dist_old = Normal(mean_old, std_old)
-                log_prob_old = dist_old.log_prob(a_agent_raw).sum(-1, keepdim=True)
-                log_prob_old -= (2 * (np.log(2) - a_agent_raw - F.softplus(-2 * a_agent_raw))).sum(-1, keepdim=True)
-            
-            # 多次优化该智能体
-            for _ in range(self.K_epochs):
-                for index in BatchSampler(SequentialSampler(range(self.batch_size)), self.mini_batch_size, False):
-                    # 当前批次数据
-                    factor_batch = factor[index]
-                    actor_input_batch = actor_input[index]
-                    a_agent_raw_batch = a_agent_raw[index]
-                    adv_batch = adv[index, :, idx].unsqueeze(-1)
-                    v_target_batch = v_target[index, :, idx].unsqueeze(-1)
-                    
-                    # 计算当前策略
-                    mean, std = self.agents[agent_id].actor(actor_input_batch)
-                    dist = Normal(mean, std)
-                    
-                    # 计算新策略的log概率
-                    log_prob = dist.log_prob(a_agent_raw_batch).sum(-1, keepdim=True)
-                    log_prob -= (2 * (np.log(2) - a_agent_raw_batch - F.softplus(-2 * a_agent_raw_batch))).sum(-1, keepdim=True)
-                    
-                    # 计算策略比率
-                    log_prob_old_batch = log_prob_old[index]
-                    ratios = torch.exp(log_prob - log_prob_old_batch)
-                    
-                    # HAPPO: 应用保护因子修正优势
-                    surr1 = ratios * adv_batch * factor_batch
-                    surr2 = torch.clamp(ratios, 1-self.epsilon, 1+self.epsilon) * adv_batch * factor_batch
-                    actor_loss = -torch.min(surr1, surr2).mean()
-                    
-                    # 计算熵损失
-                    entropy = dist.entropy().sum(-1, keepdim=True).mean()
-                    actor_loss -= self.entropy_coef * entropy
-                    
-                    # 更新actor
-                    self.agents[agent_id].update_actor(actor_loss)
-                    
-                    # 计算critic值 - 直接使用全局状态
-                    s_global_batch = batch['s'][index]  # (mini_batch_size, episode_limit, state_dim)
-                    
-                    # 将批次数据重塑为 (batch_size * episode_limit, state_dim)
-                    s_global_reshaped = s_global_batch.view(-1, s_global_batch.size(-1))
-                    v_now = self.agents[agent_id].critic(s_global_reshaped)
-                    # 重塑回 (batch_size, episode_limit, 1)
-                    v_now = v_now.view(len(index), self.episode_limit, 1)
-                    
-                    # 计算critic损失
-                    if self.use_value_clip:
-                        v_old = batch['v_n'][index, :-1, idx].unsqueeze(-1).detach()
-                        v_clipped = v_old + torch.clamp(v_now - v_old, -self.epsilon, self.epsilon)
-                        critic_loss1 = (v_now - v_target_batch)**2
-                        critic_loss2 = (v_clipped - v_target_batch)**2
-                        critic_loss = torch.max(critic_loss1, critic_loss2).mean()
-                    else:
-                        critic_loss = ((v_now - v_target_batch)**2).mean()
-                    
-                    # 更新critic
-                    self.agents[agent_id].update_critic(critic_loss)
-            
-            # HAPPO: 更新保护因子
-            with torch.no_grad():
-                mean_new, std_new = self.agents[agent_id].actor(actor_input)
-                dist_new = Normal(mean_new, std_new)
-                log_prob_new = dist_new.log_prob(a_agent_raw).sum(-1, keepdim=True)
-                log_prob_new -= (2 * (np.log(2) - a_agent_raw - F.softplus(-2 * a_agent_raw))).sum(-1, keepdim=True)
+                # 获取该智能体的真实观察维度
+                agent_obs_dim = self.dim_info[agent_id][0]
                 
-                factor = factor * torch.exp(log_prob_new - log_prob_old).detach()
-        
-        # 学习率衰减
-        if self.use_lr_decay:
-            self.lr_decay(total_steps)
+                # 从填充的观察中提取该智能体的实际观察
+                obs_agent_padded = batch['obs_n'][:, :, idx, :]  # (B, T, max_obs_dim)
+                obs_agent = obs_agent_padded[:, :, :agent_obs_dim]  # (B, T, agent_obs_dim)
+                a_agent_raw = a_n_raw_dict[agent_id]  # 使用该智能体的原始动作
+                
+                # 构建输入
+                if self.add_agent_id:
+                    one_hot = torch.eye(self.N, device=adv.device)[idx].view(1, 1, -1).repeat(self.batch_size, self.episode_limit, 1)
+                    actor_input = torch.cat([obs_agent, one_hot], dim=-1)
+                else:
+                    actor_input = obs_agent
+                    
+                # 计算更新前的log概率
+                with torch.no_grad():
+                    mean_old, std_old = self.agents[agent_id].actor(actor_input)
+                    dist_old = Normal(mean_old, std_old)
+                    log_prob_old = dist_old.log_prob(a_agent_raw).sum(-1, keepdim=True)
+                    log_prob_old -= (2 * (np.log(2) - a_agent_raw - F.softplus(-2 * a_agent_raw))).sum(-1, keepdim=True)
+                
+                # 存储该智能体的Critic损失
+                agent_critic_losses = []
+                
+                # 多次优化该智能体
+                for _ in range(self.K_epochs):
+                    for index in BatchSampler(SequentialSampler(range(self.batch_size)), self.mini_batch_size, False):
+                        # 当前批次数据
+                        factor_batch = factor[index]
+                        actor_input_batch = actor_input[index]
+                        a_agent_raw_batch = a_agent_raw[index]
+                        adv_batch = adv[index, :, idx].unsqueeze(-1)
+                        v_target_batch = v_target[index, :, idx].unsqueeze(-1)
+                        
+                        # 计算当前策略
+                        mean, std = self.agents[agent_id].actor(actor_input_batch)
+                        dist = Normal(mean, std)
+                        
+                        # 计算新策略的log概率
+                        log_prob = dist.log_prob(a_agent_raw_batch).sum(-1, keepdim=True)
+                        log_prob -= (2 * (np.log(2) - a_agent_raw_batch - F.softplus(-2 * a_agent_raw_batch))).sum(-1, keepdim=True)
+                        
+                        # 计算策略比率
+                        log_prob_old_batch = log_prob_old[index]
+                        ratios = torch.exp(log_prob - log_prob_old_batch)
+                        
+                        # HAPPO: 应用保护因子修正优势
+                        surr1 = ratios * adv_batch * factor_batch
+                        surr2 = torch.clamp(ratios, 1-self.epsilon, 1+self.epsilon) * adv_batch * factor_batch
+                        actor_loss = -torch.min(surr1, surr2).mean()
+                        
+                        # 计算熵损失
+                        entropy = dist.entropy().sum(-1, keepdim=True).mean()
+                        actor_loss -= self.entropy_coef * entropy
+                        
+                        # 更新actor
+                        self.agents[agent_id].update_actor(actor_loss)
+                        
+                        # 计算critic值 - 直接使用全局状态
+                        s_global_batch = batch['s'][index]  # (mini_batch_size, episode_limit, state_dim)
+                        
+                        # 将批次数据重塑为 (batch_size * episode_limit, state_dim)
+                        s_global_reshaped = s_global_batch.view(-1, s_global_batch.size(-1))
+                        v_now = self.agents[agent_id].critic(s_global_reshaped)
+                        # 重塑回 (batch_size, episode_limit, 1)
+                        v_now = v_now.view(len(index), self.episode_limit, 1)
+                        
+                        # 计算critic损失
+                        if self.use_value_clip:
+                            v_old = batch['v_n'][index, :-1, idx].unsqueeze(-1).detach()
+                            v_clipped = v_old + torch.clamp(v_now - v_old, -self.epsilon, self.epsilon)
+                            critic_loss1 = (v_now - v_target_batch)**2
+                            critic_loss2 = (v_clipped - v_target_batch)**2
+                            critic_loss = torch.max(critic_loss1, critic_loss2).mean()
+                        else:
+                            critic_loss = ((v_now - v_target_batch)**2).mean()
+                        
+                        # 存储该批次的Critic损失
+                        agent_critic_losses.append(critic_loss.item())
+                        
+                        # 更新critic
+                        self.agents[agent_id].update_critic(critic_loss)
+                
+                # 计算该智能体的平均Critic损失
+                if agent_critic_losses:
+                    critic_losses[agent_id] = sum(agent_critic_losses) / len(agent_critic_losses)
+                
+                # HAPPO: 更新保护因子
+                with torch.no_grad():
+                    mean_new, std_new = self.agents[agent_id].actor(actor_input)
+                    dist_new = Normal(mean_new, std_new)
+                    log_prob_new = dist_new.log_prob(a_agent_raw).sum(-1, keepdim=True)
+                    log_prob_new -= (2 * (np.log(2) - a_agent_raw - F.softplus(-2 * a_agent_raw))).sum(-1, keepdim=True)
+                    
+                    factor = factor * torch.exp(log_prob_new - log_prob_old).detach()
+            
+            # 学习率衰减
+            if self.use_lr_decay:
+                self.lr_decay(total_steps)
+            
+            # 返回Critic损失用于TensorBoard记录
+            return critic_losses
 
     def lr_decay(self, total_steps):
         lr_now = self.lr * (1 - total_steps / self.max_train_steps)

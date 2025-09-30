@@ -31,7 +31,7 @@ class Normalization:
         if update:
             self.running_ms.update(x)
         x = (x - self.running_ms.mean) / (self.running_ms.std + 1e-8)
-
+        x /= 6.3 # 为了让critic的loss 到 1 —— 曾大的方法
         return x
 
 

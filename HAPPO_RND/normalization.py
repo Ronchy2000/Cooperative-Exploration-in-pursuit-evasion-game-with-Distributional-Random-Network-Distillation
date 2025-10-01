@@ -3,23 +3,34 @@ import numpy as np
 
 class RunningMeanStd:
     # Dynamically calculate mean and std
-    def __init__(self, shape):  # shape:the dimension of input data
+    def __init__(self, shape=(), epsilon=1e-4):  # shape:the dimension of input data
         self.n = 0
         self.mean = np.zeros(shape)
-        self.S = np.zeros(shape)
-        self.std = np.sqrt(self.S)
+        self.var = np.ones(shape)
+        self.std = np.ones(shape)
+        self.epsilon = epsilon
 
     def update(self, x):
         x = np.array(x)
-        self.n += 1
-        if self.n == 1:
-            self.mean = x
-            self.std = x
-        else:
-            old_mean = self.mean.copy()
-            self.mean = old_mean + (x - old_mean) / self.n
-            self.S = self.S + (x - old_mean) * (x - self.mean)
-            self.std = np.sqrt(self.S / self.n)
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        total_count = self.n + batch_count
+
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.n
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.n * batch_count / total_count
+        new_var = M2 / total_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.std = np.sqrt(np.maximum(self.var, self.epsilon))
+        self.n = total_count
 
 
 class Normalization:
@@ -31,7 +42,7 @@ class Normalization:
         if update:
             self.running_ms.update(x)
         x = (x - self.running_ms.mean) / (self.running_ms.std + 1e-8)
-
+        x /= 6.3 # 为了让critic的loss 到 1 —— 曾大的方法
         return x
 
 
@@ -50,3 +61,21 @@ class RewardScaling:
 
     def reset(self):  # When an episode is done,we should reset 'self.R'
         self.R = np.zeros(self.shape)
+
+
+class RewardForwardFilter:
+    """Used for normalizing intrinsic rewards"""
+    def __init__(self, gamma):
+        self.rewems = None
+        self.gamma = gamma
+
+    def update(self, rews):
+        # 确保输入是 numpy 数组
+        if not isinstance(rews, np.ndarray):
+            rews = np.array(rews)
+        
+        if self.rewems is None:
+            self.rewems = rews
+        else:
+            self.rewems = self.rewems * self.gamma + rews
+        return self.rewems
